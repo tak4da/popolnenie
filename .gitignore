@@ -8,3 +8,5 @@ venv/
 .DS_Store
 faq_extracted.json
 terms_extracted.json
+echo "faq_extracted.json" >> .gitignore
+echo "terms_extracted.json" >> .gitignore
