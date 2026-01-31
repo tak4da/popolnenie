@@ -56,6 +56,18 @@ def normalize(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
     return text
 
+NEGATIVE_CHOICE_PHRASES = {
+    "нет подходящих вариантов",
+    "нет вариантов",
+    "не подходит",
+    "ничего не подходит",
+    "не то",
+    "другое",
+    "мимо",
+    "неверно",
+    "нет подходящих",
+}
+
 
 def load_json(path: str) -> Any:
     with open(path, "r", encoding="utf-8") as f:
@@ -664,14 +676,14 @@ async def search_query_handler(message: Message, state: FSMContext) -> None:
         if ids:
             ids_top, opts = format_top_options(ids, limit=3)
             await state.set_state(ChoiceFlow.waiting_choice)
-            await state.update_data(choice_ids=ids_top)
+            await state.update_data(choice_ids=ids_top, last_query=user_text, choice_rejects=0)
             await message.answer("Если хочешь, выбери вариант (1-3):\n" + opts)
         return
 
     if ids:
         ids_top, opts = format_top_options(ids, limit=3)
         await state.set_state(ChoiceFlow.waiting_choice)
-        await state.update_data(choice_ids=ids_top)
+        await state.update_data(choice_ids=ids_top, last_query=user_text, choice_rejects=0)
         await message.answer("Похоже на несколько вариантов. Напиши номер (1-3):\n" + opts)
     else:
         await message.answer("По базе пока не попал. Попробуй другими словами.")
@@ -795,14 +807,14 @@ async def default_text_handler(message: Message, state: FSMContext) -> None:
         if ids:
             ids_top, opts = format_top_options(ids, limit=3)
             await state.set_state(ChoiceFlow.waiting_choice)
-            await state.update_data(choice_ids=ids_top)
+            await state.update_data(choice_ids=ids_top, last_query=user_text, choice_rejects=0)
             await message.answer("Если хочешь, выбери вариант (1-3):\n" + opts)
         return
 
     if ids:
         ids_top, opts = format_top_options(ids, limit=3)
         await state.set_state(ChoiceFlow.waiting_choice)
-        await state.update_data(choice_ids=ids_top)
+        await state.update_data(choice_ids=ids_top, last_query=user_text, choice_rejects=0)
         await message.answer("Похоже на несколько вариантов. Напиши номер (1-3):\n" + opts)
     else:
         await message.answer("Не нашёл точного ответа. Попробуй переформулировать вопрос чуть проще.")
@@ -818,16 +830,58 @@ async def choice_handler(message: Message, state: FSMContext) -> None:
     if not txt:
         return
 
-    m = re.match(r"^(?:вариант\s*)?(\d)$", txt.lower())
-    if not m:
-        await message.answer("Напиши номер 1, 2 или 3 (или просто переформулируй вопрос).")
+    nt = normalize(txt)
+
+    # Пользователь сказал, что варианты не подходят — не зацикливаемся, делаем второй заход.
+    if nt in NEGATIVE_CHOICE_PHRASES:
+        data = await state.get_data()
+        last_query = (data.get("last_query") or "").strip()
+
+        rejects = int(data.get("choice_rejects", 0) or 0) + 1
+        await state.clear()
+
+        # Если уже второй отказ — просим контекст, чтобы не гонять модель по кругу.
+        if rejects >= 2:
+            await message.answer(
+                "Ок, понял. Напиши одним сообщением: что именно делаешь, где (ОП/LMWork) и точный текст ошибки/что видишь на экране."
+            )
+            return
+
+        if last_query:
+            # второй проход: шире кандидаты + подсказка модели, что первый выбор не подошёл
+            ids2 = fuzzy_candidates_all(last_query, top_k=25)
+            result2 = deepseek_answer_from_context(
+                last_query + "\nПользователь сказал: предложенные варианты не подошли. Дай прямой ответ по ситуации (строго по базе).",
+                ids2,
+            )
+
+            ans2 = (result2.get("answer") or "").strip()
+            conf2 = float(result2.get("confidence", 0.0) or 0.0)
+            used2 = result2.get("used_ids") or []
+
+            if ans2 and conf2 >= 0.40:
+                if used2:
+                    inc_stat(str(used2[0]))
+                await message.answer(ans2)
+                return
+
+        await message.answer(
+            "Ок, вариантов из базы не вижу. Напиши чуть конкретнее: что именно не работает и что написано в ошибке."
+        )
         return
 
-    n = int(m.group(1))
+    # Если вместо номера пришёл обычный текст — воспринимаем как новый вопрос
+    mnum = re.match(r"^(?:вариант\s*)?(\d)$", txt.lower())
+    if not mnum:
+        await state.clear()
+        await default_text_handler(message, state)
+        return
+
+    n = int(mnum.group(1))
     data = await state.get_data()
     ids = data.get("choice_ids") or []
     if not (1 <= n <= len(ids)):
-        await message.answer("Такого варианта нет. Напиши 1, 2 или 3.")
+        await message.answer("Такого варианта нет. Напиши 1, 2 или 3 (или опиши ситуацию по-другому).")
         return
 
     qid = str(ids[n - 1])
