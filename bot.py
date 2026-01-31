@@ -88,6 +88,9 @@ FAQ_CATEGORIES: List[Dict[str, Any]] = FAQ_SEG.get("faq", [])
 FAQ_BY_ID: Dict[str, Dict[str, Any]] = {}
 FAQ_QUESTIONS_NORM: List[str] = []
 FAQ_NORM_TO_ID: Dict[str, str] = {}
+FAQ_ANSWERS_NORM: List[str] = []
+FAQ_ANSWER_NORM_TO_ID: Dict[str, str] = {}
+
 
 for cat in FAQ_CATEGORIES:
     for grp in cat.get("groups", []):
@@ -98,6 +101,14 @@ for cat in FAQ_CATEGORIES:
             FAQ_QUESTIONS_NORM.append(qn)
             # если вдруг дубль формулировки — оставим первый, это ок
             FAQ_NORM_TO_ID.setdefault(qn, qid)
+# нормализованные ответы тоже добавим в поиск
+for qid, it in FAQ_BY_ID.items():
+    an = normalize(it.get("a", ""))
+    if an:
+        FAQ_ANSWERS_NORM.append(an)
+        # если вдруг дубль ответов — оставим первый
+        FAQ_ANSWER_NORM_TO_ID.setdefault(an, qid)
+
 
 # TERMS: dict kind -> list[{term, definition}]
 TERM_KINDS: List[str] = sorted(list(TERMS_SEG.keys()))
@@ -167,6 +178,96 @@ def fuzzy_candidates(user_text: str, top_k: int) -> List[Tuple[str, int]]:
             out.append((match, int(score)))
     return out
 
+
+
+
+def fuzzy_candidates_all(user_text: str, top_k: int) -> List[str]:
+    """Кандидаты FAQ по вопросам + по ответам, сразу списком id."""
+    user_norm = normalize(user_text)
+
+    q_hits = process.extract(user_norm, FAQ_QUESTIONS_NORM, scorer=fuzz.WRatio, limit=top_k)
+    a_hits = process.extract(user_norm, FAQ_ANSWERS_NORM, scorer=fuzz.WRatio, limit=top_k)
+
+    ids: List[str] = []
+
+    for match, score, _ in q_hits:
+        if score >= FUZZY_MIN:
+            qid = FAQ_NORM_TO_ID.get(match)
+            if qid and qid not in ids:
+                ids.append(qid)
+
+    for match, score, _ in a_hits:
+        if score >= FUZZY_MIN:
+            qid = FAQ_ANSWER_NORM_TO_ID.get(match)
+            if qid and qid not in ids:
+                ids.append(qid)
+
+    return ids[:10]
+
+
+def deepseek_answer_from_context(user_text: str, ids: List[str]) -> Dict[str, Any]:
+    """Собирает ответ строго по найденным пунктам базы (grounded)."""
+    ctx: List[Dict[str, Any]] = []
+    for qid in ids[:8]:
+        it = FAQ_BY_ID.get(qid)
+        if it:
+            ctx.append({"id": qid, "q": it.get("q", ""), "a": it.get("a", "")})
+
+    if not ctx:
+        return {
+            "answer": None,
+            "used_ids": [],
+            "confidence": 0.0,
+            "need_clarify": True,
+            "clarify_question": "Я не нашёл в базе подходящий пункт. Попробуй другими словами или добавь ключевое слово.",
+        }
+
+    system = (
+        "Ты умный помощник FAQ-бота для внутренних процессов. "
+        "Твоя главная задача: дать точный и короткий ответ по ситуации. "
+        "У тебя есть КОНТЕКСТ (пункты базы). "
+        "Правила: "
+        "1) Отвечай ТОЛЬКО на основе контекста. Не выдумывай. "
+        "2) Если контекста не хватает, скажи, что в базе нет точного ответа, и задай 1 уточняющий вопрос. "
+        "3) Если подходят несколько пунктов, аккуратно объедини их, но без воды. "
+        "Верни строго JSON без лишнего текста."
+    )
+
+    user = {
+        "user_query": user_text,
+        "context": ctx,
+        "output_format": {
+            "answer": "string|null",
+            "used_ids": "array of string",
+            "confidence": "number 0..1",
+            "need_clarify": "boolean",
+            "clarify_question": "string|null",
+        },
+    }
+
+    resp = ds_client.chat.completions.create(
+        model=DEEPSEEK_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+        temperature=0.0,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, flags=re.S)
+        if m:
+            return json.loads(m.group(0))
+        return {
+            "answer": None,
+            "used_ids": [],
+            "confidence": 0.0,
+            "need_clarify": True,
+            "clarify_question": "Не смог разобрать ответ модели. Спроси чуть проще или выбери вариант из поиска.",
+        }
 
 def deepseek_pick_id(user_text: str, candidates: List[Tuple[str, int]]) -> Dict[str, Any]:
     cand_payload = []
@@ -513,25 +614,32 @@ async def search_query_handler(message: Message, state: FSMContext) -> None:
         await message.answer(f"{found_term[0].upper()}: {found_term[1]}")
         return
 
-    candidates = fuzzy_candidates(user_text, TOP_K)
-    pick = deepseek_pick_id(user_text, candidates)
+    ids = fuzzy_candidates_all(user_text, TOP_K)
+    result = deepseek_answer_from_context(user_text, ids)
 
-    picked_id = pick.get("id")
-    conf = float(pick.get("confidence", 0.0) or 0.0)
+    ans = result.get("answer")
+    conf = float(result.get("confidence", 0.0) or 0.0)
+    used_ids = result.get("used_ids") or []
 
-    if picked_id and picked_id in FAQ_BY_ID and conf >= LLM_MIN_CONF:
-        inc_stat(picked_id)
-        await message.answer(FAQ_BY_ID[picked_id]["a"])
+    # если модель уверенно собрала ответ из базы — отвечаем сразу
+    if ans and conf >= LLM_MIN_CONF:
+        # статистику логичнее писать по первому использованному пункту
+        if used_ids:
+            inc_stat(str(used_ids[0]))
+        await message.answer(str(ans))
         return
 
-    ids: List[str] = []
-    for q_norm, _ in candidates[:8]:
-        qid = FAQ_NORM_TO_ID.get(q_norm)
-        if qid and qid not in ids:
-            ids.append(qid)
+    # если нужна уточнялка — спросим, но дадим варианты кнопками
+    if bool(result.get("need_clarify")):
+        clarify = result.get("clarify_question") or "Уточни вопрос, пожалуйста."
+        await message.answer(str(clarify))
+        if ids:
+            await message.answer("Если хочешь, выбери ближе всего:", reply_markup=search_results_kb(ids))
+        return
 
+    # запасной вариант: показать кандидатов
     if ids:
-        await message.answer("Не уверен на 100%. Выбери ближе всего:", reply_markup=search_results_kb(ids))
+        await message.answer("Похоже на несколько вариантов. Выбери ближе всего:", reply_markup=search_results_kb(ids))
     else:
         await message.answer("По базе пока не попал. Попробуй другими словами.")
 
