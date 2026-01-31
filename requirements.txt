@@ -1,0 +1,5 @@
+aiogram==3.24.0
+python-dotenv
+rapidfuzz
+openai
+

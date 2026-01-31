@@ -1,0 +1,10 @@
+.env
+stats.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.DS_Store
+faq_extracted.json
+terms_extracted.json
