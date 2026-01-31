@@ -328,6 +328,11 @@ class TermSearchFlow(StatesGroup):
     waiting_query = State()
 
 
+class ChoiceFlow(StatesGroup):
+    waiting_choice = State()
+
+
+
 # =========================
 # UI: KEYBOARDS
 # =========================
@@ -423,6 +428,19 @@ def search_results_kb(ids: List[str]) -> InlineKeyboardMarkup:
     kb.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
+def format_top_options(ids: List[str], limit: int = 3) -> Tuple[List[str], str]:
+    """Return (ids_top, text_block) where text_block is numbered options."""
+    ids_top = [str(x) for x in ids[:limit]]
+    lines = []
+    for i, qid in enumerate(ids_top, 1):
+        it = FAQ_BY_ID.get(qid) or {}
+        q = (it.get('q') or '').strip()
+        if not q:
+            q = f"Вариант {i}"
+        lines.append(f"{i}) {q[:120]}")
+    return ids_top, "\n".join(lines)
+
+
 
 # ---- TOP ----
 def top_kb() -> InlineKeyboardMarkup:
@@ -480,7 +498,9 @@ def term_list_kb(kind_index: int, page: int) -> InlineKeyboardMarkup:
 # =========================
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Выбирай, как искать ответ:", reply_markup=main_menu_kb())
+    await message.answer(
+        "Привет! Напиши вопрос обычным текстом. Я постараюсь найти точный ответ в базе."
+    )
 
 
 async def noop(call: CallbackQuery) -> None:
@@ -606,7 +626,6 @@ async def search_query_handler(message: Message, state: FSMContext) -> None:
     # быстрый ответ термином — только если это реально запрос термина
     nt = normalize(user_text)
 
-    # 1) почти точное совпадение с термином (пользователь ввёл сам термин)
     best = process.extractOne(nt, list(TERM_MAP.keys()), scorer=fuzz.WRatio)
     if best:
         term_norm, score, _ = best
@@ -614,7 +633,6 @@ async def search_query_handler(message: Message, state: FSMContext) -> None:
             await message.answer(f"{term_norm.upper()}: {TERM_MAP[term_norm]}")
             return
 
-    # 2) явный вопрос "что такое/что значит/расшифруй/определи ..."
     m = re.match(r"^(что такое|что значит|расшифруй|определи)\s+(.+)$", nt)
     if m:
         q = m.group(2).strip()
@@ -632,25 +650,29 @@ async def search_query_handler(message: Message, state: FSMContext) -> None:
     conf = float(result.get("confidence", 0.0) or 0.0)
     used_ids = result.get("used_ids") or []
 
-    # если модель уверенно собрала ответ из базы — отвечаем сразу
     if ans and conf >= LLM_MIN_CONF:
-        # статистику логичнее писать по первому использованному пункту
         if used_ids:
             inc_stat(str(used_ids[0]))
         await message.answer(str(ans))
+        await state.clear()
         return
 
-    # если нужна уточнялка — спросим, но дадим варианты кнопками
+    # если нужна уточнялка — спросим, и предложим до 3 вариантов
     if bool(result.get("need_clarify")):
         clarify = result.get("clarify_question") or "Уточни вопрос, пожалуйста."
         await message.answer(str(clarify))
         if ids:
-            await message.answer("Если хочешь, выбери ближе всего:", reply_markup=search_results_kb(ids))
+            ids_top, opts = format_top_options(ids, limit=3)
+            await state.set_state(ChoiceFlow.waiting_choice)
+            await state.update_data(choice_ids=ids_top)
+            await message.answer("Если хочешь, выбери вариант (1-3):\n" + opts)
         return
 
-    # запасной вариант: показать кандидатов
     if ids:
-        await message.answer("Похоже на несколько вариантов. Выбери ближе всего:", reply_markup=search_results_kb(ids))
+        ids_top, opts = format_top_options(ids, limit=3)
+        await state.set_state(ChoiceFlow.waiting_choice)
+        await state.update_data(choice_ids=ids_top)
+        await message.answer("Похоже на несколько вариантов. Напиши номер (1-3):\n" + opts)
     else:
         await message.answer("По базе пока не попал. Попробуй другими словами.")
 
@@ -722,8 +744,10 @@ async def term_search_handler(message: Message, state: FSMContext) -> None:
 
 # ---- DEFAULT TEXT (optional smart assist) ----
 async def default_text_handler(message: Message, state: FSMContext) -> None:
-    # если пользователь в поиске/поиске терминов, не мешаем
+    # если ждём выбор варианта — не вмешиваемся
     st = await state.get_state()
+    if st == ChoiceFlow.waiting_choice.state:
+        return
     if st in {SearchFlow.waiting_query.state, TermSearchFlow.waiting_query.state}:
         return
 
@@ -769,14 +793,53 @@ async def default_text_handler(message: Message, state: FSMContext) -> None:
         clarify = result.get("clarify_question") or "Уточни вопрос, пожалуйста."
         await message.answer(str(clarify))
         if ids:
-            await message.answer("Если хочешь, выбери ближе всего:", reply_markup=search_results_kb(ids))
+            ids_top, opts = format_top_options(ids, limit=3)
+            await state.set_state(ChoiceFlow.waiting_choice)
+            await state.update_data(choice_ids=ids_top)
+            await message.answer("Если хочешь, выбери вариант (1-3):\n" + opts)
         return
 
-    # fallback: показать кандидатов или меню
     if ids:
-        await message.answer("Похоже на несколько вариантов. Выбери ближе всего:", reply_markup=search_results_kb(ids))
+        ids_top, opts = format_top_options(ids, limit=3)
+        await state.set_state(ChoiceFlow.waiting_choice)
+        await state.update_data(choice_ids=ids_top)
+        await message.answer("Похоже на несколько вариантов. Напиши номер (1-3):\n" + opts)
     else:
-        await message.answer("Не понял, к чему это в базе. Попробуй другими словами или открой меню:", reply_markup=main_menu_kb())
+        await message.answer("Не нашёл точного ответа. Попробуй переформулировать вопрос чуть проще.")
+
+
+# ---- CHOICE (1..3) ----
+async def choice_handler(message: Message, state: FSMContext) -> None:
+    st = await state.get_state()
+    if st != ChoiceFlow.waiting_choice.state:
+        return
+
+    txt = (message.text or "").strip()
+    if not txt:
+        return
+
+    m = re.match(r"^(?:вариант\s*)?(\d)$", txt.lower())
+    if not m:
+        await message.answer("Напиши номер 1, 2 или 3 (или просто переформулируй вопрос).")
+        return
+
+    n = int(m.group(1))
+    data = await state.get_data()
+    ids = data.get("choice_ids") or []
+    if not (1 <= n <= len(ids)):
+        await message.answer("Такого варианта нет. Напиши 1, 2 или 3.")
+        return
+
+    qid = str(ids[n - 1])
+    it = FAQ_BY_ID.get(qid)
+    if not it:
+        await message.answer("Не нашёл этот пункт в базе. Спроси по-другому.")
+        await state.clear()
+        return
+
+    inc_stat(qid)
+    await message.answer(str(it.get("a") or ""))
+    await state.clear()
 
 
 # =========================
@@ -791,24 +854,15 @@ def main() -> None:
 
     dp.message.register(cmd_start, F.text.in_({"/start", "/help"}))
 
-    dp.callback_query.register(menu_router, F.data.startswith("menu:"))
-    dp.callback_query.register(noop, F.data == "noop")
+    # выбор варианта (1..3), если бот предложил несколько трактовок
+    dp.message.register(choice_handler, ChoiceFlow.waiting_choice, F.text)
 
-    dp.callback_query.register(faq_cat_handler, F.data.startswith("faq_cat:"))
-    dp.callback_query.register(faq_group_handler, F.data.startswith("faq_grp:"))
-    dp.callback_query.register(faq_question_handler, F.data.startswith("faq_q:"))
-
-    dp.callback_query.register(term_kind_handler, F.data.startswith("term_kind:"))
-    dp.callback_query.register(term_show_handler, F.data.startswith("term_show:"))
-
-    dp.message.register(search_query_handler, SearchFlow.waiting_query, F.text)
-    dp.message.register(term_search_handler, TermSearchFlow.waiting_query, F.text)
-
+    # основной умный режим
     dp.message.register(default_text_handler, F.text)
+
 
     dp.run_polling(bot)
 
 
 if __name__ == "__main__":
     main()
-
