@@ -39,9 +39,9 @@ DB_PATH = "stats.db"
 FAQ_PAGE_SIZE = 5
 TERMS_PAGE_SIZE = 8
 
-TOP_K = 10
-FUZZY_MIN = 55
-LLM_MIN_CONF = 0.55
+TOP_K = 20
+FUZZY_MIN = 50
+LLM_MIN_CONF = 0.45
 
 DEEPSEEK_MODEL = "deepseek-chat"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
@@ -91,24 +91,22 @@ FAQ_NORM_TO_ID: Dict[str, str] = {}
 FAQ_ANSWERS_NORM: List[str] = []
 FAQ_ANSWER_NORM_TO_ID: Dict[str, str] = {}
 
-
 for cat in FAQ_CATEGORIES:
     for grp in cat.get("groups", []):
         for it in grp.get("items", []):
             qid = it["id"]
             FAQ_BY_ID[qid] = it
-            qn = normalize(it.get("q", ""))
-            FAQ_QUESTIONS_NORM.append(qn)
-            # если вдруг дубль формулировки — оставим первый, это ок
-            FAQ_NORM_TO_ID.setdefault(qn, qid)
-# нормализованные ответы тоже добавим в поиск
-for qid, it in FAQ_BY_ID.items():
-    an = normalize(it.get("a", ""))
-    if an:
-        FAQ_ANSWERS_NORM.append(an)
-        # если вдруг дубль ответов — оставим первый
-        FAQ_ANSWER_NORM_TO_ID.setdefault(an, qid)
 
+            qn = normalize(it.get("q", ""))
+            if qn:
+                FAQ_QUESTIONS_NORM.append(qn)
+                # если вдруг дубль формулировки — оставим первый, это ок
+                FAQ_NORM_TO_ID.setdefault(qn, qid)
+
+            an = normalize(it.get("a", ""))
+            if an:
+                FAQ_ANSWERS_NORM.append(an)
+                FAQ_ANSWER_NORM_TO_ID.setdefault(an, qid)
 
 # TERMS: dict kind -> list[{term, definition}]
 TERM_KINDS: List[str] = sorted(list(TERMS_SEG.keys()))
@@ -179,10 +177,8 @@ def fuzzy_candidates(user_text: str, top_k: int) -> List[Tuple[str, int]]:
     return out
 
 
-
-
 def fuzzy_candidates_all(user_text: str, top_k: int) -> List[str]:
-    """Кандидаты FAQ по вопросам + по ответам, сразу списком id."""
+    """Кандидаты по вопросам + ответам. Возвращает список id."""
     user_norm = normalize(user_text)
 
     q_hits = process.extract(user_norm, FAQ_QUESTIONS_NORM, scorer=fuzz.WRatio, limit=top_k)
@@ -202,7 +198,7 @@ def fuzzy_candidates_all(user_text: str, top_k: int) -> List[str]:
             if qid and qid not in ids:
                 ids.append(qid)
 
-    return ids[:10]
+    return ids[:max(8, min(20, top_k))]
 
 
 def deepseek_answer_from_context(user_text: str, ids: List[str]) -> Dict[str, Any]:
@@ -228,12 +224,12 @@ def deepseek_answer_from_context(user_text: str, ids: List[str]) -> Dict[str, An
         "У тебя есть КОНТЕКСТ (пункты базы). "
         "Правила: "
         "1) Отвечай ТОЛЬКО на основе контекста. Не выдумывай. "
-        "2) Если контекста не хватает, скажи, что в базе нет точного ответа, и задай 1 уточняющий вопрос. "
-        "3) Если подходят несколько пунктов, аккуратно объедини их, но без воды. "
-        "Верни строго JSON без лишнего текста."
+        "2) Если в контексте нет точного ответа — скажи об этом и задай ОДИН уточняющий вопрос. "
+        "3) Если подходят несколько пунктов — аккуратно объедини, но без воды. "
+        "Верни строго JSON."
     )
 
-    user = {
+    payload = {
         "user_query": user_text,
         "context": ctx,
         "output_format": {
@@ -249,83 +245,53 @@ def deepseek_answer_from_context(user_text: str, ids: List[str]) -> Dict[str, An
         model=DEEPSEEK_MODEL,
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
         temperature=0.0,
     )
 
-    text = (resp.choices[0].message.content or "").strip()
+    raw = (resp.choices[0].message.content or "").strip()
     try:
-        return json.loads(text)
+        return json.loads(raw)
     except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, flags=re.S)
-        if m:
-            return json.loads(m.group(0))
+        mm = re.search(r"\{.*\}", raw, flags=re.S)
+        if mm:
+            return json.loads(mm.group(0))
         return {
             "answer": None,
             "used_ids": [],
             "confidence": 0.0,
             "need_clarify": True,
-            "clarify_question": "Не смог разобрать ответ модели. Спроси чуть проще или выбери вариант из поиска.",
+            "clarify_question": "Не смог разобрать ответ модели. Спроси чуть проще или выбери из вариантов.",
         }
 
-def deepseek_pick_id(user_text: str, candidates: List[Tuple[str, int]]) -> Dict[str, Any]:
-    cand_payload = []
-    for q_norm, score in candidates:
-        qid = FAQ_NORM_TO_ID.get(q_norm)
-        if qid and qid in FAQ_BY_ID:
-            cand_payload.append({"id": qid, "q": FAQ_BY_ID[qid]["q"], "score": score})
 
-    if not cand_payload:
-        return {"id": None, "confidence": 0.0, "reason": "no_candidates"}
+def is_term_query(user_text: str) -> Optional[Tuple[str, str]]:
+    """Возвращает (term_norm, definition) если пользователь реально просит термин."""
+    nt = normalize(user_text)
+    if not nt:
+        return None
 
-    system = (
-        "Ты классификатор запросов для FAQ-бота. "
-        "Выбери ОДИН наиболее подходящий id из списка кандидатов. "
-        "Если ни один не подходит, верни id=null. "
-        "Ответ строго JSON без лишнего текста."
-    )
+    m = re.match(r"^(что такое|что значит|расшифруй|определи)\s+(.+)$", nt)
+    if m:
+        q = m.group(2).strip()
+        best = process.extractOne(q, list(TERM_MAP.keys()), scorer=fuzz.WRatio)
+        if best:
+            term_norm, score, _ = best
+            if score >= 80:
+                defin = TERM_MAP.get(term_norm)
+                if defin:
+                    return term_norm, defin
+        return None
 
-    user = {
-        "user_query": user_text,
-        "candidates": cand_payload,
-        "output_format": {"id": "string|null", "confidence": "number 0..1", "reason": "string"},
-        "rules": [
-            "Выбирай только id из candidates",
-            "Если совпадение слабое или запрос не про это, верни id=null",
-            "confidence 0.9+ только если почти идеально",
-        ],
-    }
-
-    resp = ds_client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
-        ],
-        temperature=0.0,
-    )
-
-    text = (resp.choices[0].message.content or "").strip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, flags=re.S)
-        if m:
-            return json.loads(m.group(0))
-        return {"id": None, "confidence": 0.0, "reason": "bad_json"}
-
-
-# =========================
-# FSM
-# =========================
-class SearchFlow(StatesGroup):
-    waiting_query = State()
-
-
-class TermSearchFlow(StatesGroup):
-    waiting_query = State()
+    best2 = process.extractOne(nt, list(TERM_MAP.keys()), scorer=fuzz.WRatio)
+    if best2:
+        term_norm2, score2, _ = best2
+        if score2 >= 92:
+            defin2 = TERM_MAP.get(term_norm2)
+            if defin2:
+                return term_norm2, defin2
+    return None
 
 
 # =========================
@@ -603,15 +569,10 @@ async def search_query_handler(message: Message, state: FSMContext) -> None:
         await message.answer("Напиши текстом, что ищем 🙂")
         return
 
-    # быстрый ответ термином (если коротко)
-    found_term = None
-    if len(user_text) <= 60:
-        for tnorm, defin in TERM_MAP.items():
-            if tnorm and tnorm in normalize(user_text):
-                found_term = (tnorm, defin)
-                break
-    if found_term:
-        await message.answer(f"{found_term[0].upper()}: {found_term[1]}")
+    tq = is_term_query(user_text)
+    if tq:
+        term_norm, defin = tq
+        await message.answer(f"{term_norm.upper()}: {defin}")
         return
 
     ids = fuzzy_candidates_all(user_text, TOP_K)
@@ -619,32 +580,28 @@ async def search_query_handler(message: Message, state: FSMContext) -> None:
 
     ans = result.get("answer")
     conf = float(result.get("confidence", 0.0) or 0.0)
-    used_ids = result.get("used_ids") or []
+    used = result.get("used_ids") or []
 
-    # если модель уверенно собрала ответ из базы — отвечаем сразу
     if ans and conf >= LLM_MIN_CONF:
-        # статистику логичнее писать по первому использованному пункту
-        if used_ids:
-            inc_stat(str(used_ids[0]))
-        await message.answer(str(ans))
+        if used and used[0] in FAQ_BY_ID:
+            inc_stat(used[0])
+        await message.answer(ans)
         return
 
-    # если нужна уточнялка — спросим, но дадим варианты кнопками
-    if bool(result.get("need_clarify")):
-        clarify = result.get("clarify_question") or "Уточни вопрос, пожалуйста."
-        await message.answer(str(clarify))
+    if result.get("need_clarify"):
+        await message.answer(result.get("clarify_question") or "Уточни вопрос, пожалуйста.")
         if ids:
             await message.answer("Если хочешь, выбери ближе всего:", reply_markup=search_results_kb(ids))
         return
 
-    # запасной вариант: показать кандидатов
     if ids:
-        await message.answer("Похоже на несколько вариантов. Выбери ближе всего:", reply_markup=search_results_kb(ids))
+        await message.answer("Не уверен на 100%. Выбери ближе всего:", reply_markup=search_results_kb(ids))
     else:
         await message.answer("По базе пока не попал. Попробуй другими словами.")
 
 
 # ---- TERMS ----
+
 async def term_kind_handler(call: CallbackQuery) -> None:
     # term_kind:<kind_index>:<page>
     _, kind_index_s, page_s = call.data.split(":")
@@ -720,16 +677,44 @@ async def default_text_handler(message: Message, state: FSMContext) -> None:
     if not user_text:
         return
 
-    # если похоже на термин — ответим
-    if len(user_text) <= 60:
-        nt = normalize(user_text)
-        for term_norm, defin in TERM_MAP.items():
-            if term_norm and term_norm in nt:
-                await message.answer(f"{term_norm.upper()}: {defin}")
-                return
+    # команды обрабатываются отдельно (на всякий)
+    if user_text.startswith("/"):
+        return
 
-    # иначе мягко предлагаем меню
-    await message.answer("Открой меню и выбери способ поиска:", reply_markup=main_menu_kb())
+    # 1) Термины — только если реально просит термин
+    tq = is_term_query(user_text)
+    if tq:
+        term_norm, defin = tq
+        await message.answer(f"{term_norm.upper()}: {defin}")
+        return
+
+    # 2) Максимально умно: пробуем сразу ответить через DeepSeek по контексту
+    ids = fuzzy_candidates_all(user_text, TOP_K)
+    result = deepseek_answer_from_context(user_text, ids)
+
+    ans = result.get("answer")
+    conf = float(result.get("confidence", 0.0) or 0.0)
+    used = result.get("used_ids") or []
+
+    if ans and conf >= LLM_MIN_CONF:
+        if used and used[0] in FAQ_BY_ID:
+            inc_stat(used[0])
+        await message.answer(ans)
+        return
+
+    if result.get("need_clarify"):
+        await message.answer(result.get("clarify_question") or "Уточни вопрос, пожалуйста.")
+        if ids:
+            await message.answer("Если хочешь, выбери ближе всего:", reply_markup=search_results_kb(ids))
+        else:
+            await message.answer("Выбирай, как искать ответ:", reply_markup=main_menu_kb())
+        return
+
+    # 3) Fallback: покажем варианты или меню
+    if ids:
+        await message.answer("Могу ошибиться. Выбери ближе всего:", reply_markup=search_results_kb(ids))
+    else:
+        await message.answer("Выбирай, как искать ответ:", reply_markup=main_menu_kb())
 
 
 # =========================
